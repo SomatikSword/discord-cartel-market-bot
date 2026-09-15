@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, time, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -74,17 +74,28 @@ CHECK_INTERVAL_MINUTES = 10
 # вторник = 1
 # ...
 # воскресенье = 6
-WEEKLY_DIGEST_WEEKDAY = 6
-
-
-# После какого часа можно отправлять
-# недельный дайджест
-WEEKLY_DIGEST_HOUR = 21
-
-
-# Москва = UTC+3
+# Москва — UTC+3
 MOSCOW_TIMEZONE = timezone(
     timedelta(hours=3)
+)
+
+
+# В Python:
+# понедельник = 0
+# вторник = 1
+# среда = 2
+# ...
+# воскресенье = 6
+WEEKLY_DIGEST_WEEKDAY = 1
+
+
+# Недельный отчёт:
+# каждый день планировщик просыпается в 15:00 МСК,
+# но отправка происходит только во вторник.
+WEEKLY_DIGEST_TIME = time(
+    hour=15,
+    minute=0,
+    tzinfo=MOSCOW_TIMEZONE
 )
 
 
@@ -507,27 +518,29 @@ def parse_sale_title(title):
 # НЕДЕЛЯ
 # =========================================================
 
-def get_week_bounds(
-    target_date
+def get_digest_period(
+    report_date
 ):
     """
-    Возвращает понедельник и воскресенье
-    недели, к которой относится target_date.
+    Возвращает полный завершённый 7-дневный период.
+
+    Если отчёт отправляется во вторник,
+    то берём:
+
+    прошлый вторник -> вчерашний понедельник.
     """
 
-    monday = (
-        target_date
-        - timedelta(
-            days=target_date.weekday()
-        )
+    period_end = (
+        report_date
+        - timedelta(days=1)
     )
 
-    sunday = (
-        monday
-        + timedelta(days=6)
+    period_start = (
+        period_end
+        - timedelta(days=6)
     )
 
-    return monday, sunday
+    return period_start, period_end
 
 
 def get_sales_for_week(
@@ -582,11 +595,14 @@ class CartelMarketBot(discord.Client):
 
     async def setup_hook(self):
         """
-        Запускаем фоновую проверку
-        после создания Discord-клиента.
+        Запускаем две независимые фоновые задачи:
+
+        1. проверка ежедневной Flash Sale;
+        2. недельный отчёт.
         """
 
         self.cartel_watcher.start()
+        self.weekly_digest_watcher.start()
 
 
     async def on_ready(self):
@@ -618,19 +634,10 @@ class CartelMarketBot(discord.Client):
         minutes=CHECK_INTERVAL_MINUTES
     )
     async def cartel_watcher(self):
-        """
-        Одна фоновая задача выполняет:
-
-        1. проверку Flash Sale;
-        2. проверку необходимости
-           недельного дайджеста.
-        """
 
         try:
 
             await self.check_flash_sale()
-
-            await self.check_weekly_digest()
 
         except aiohttp.ClientError as error:
 
@@ -642,12 +649,53 @@ class CartelMarketBot(discord.Client):
         except Exception:
 
             logger.exception(
-                "Неожиданная ошибка"
+                "Ошибка при проверке Flash Sale"
             )
 
 
     @cartel_watcher.before_loop
     async def before_cartel_watcher(self):
+
+        await self.wait_until_ready()
+
+
+    # =====================================================
+    # НЕДЕЛЬНЫЙ ПЛАНИРОВЩИК
+    # =====================================================
+
+    @tasks.loop(
+        time=WEEKLY_DIGEST_TIME
+    )
+    async def weekly_digest_watcher(self):
+        """
+        Планировщик запускается в 15:00 МСК.
+
+        Сам отчёт отправляем только во вторник.
+        """
+
+        now = datetime.now(
+            MOSCOW_TIMEZONE
+        )
+
+        if (
+                now.weekday()
+                != WEEKLY_DIGEST_WEEKDAY
+        ):
+            return
+
+        try:
+
+            await self.send_weekly_digest()
+
+        except Exception:
+
+            logger.exception(
+                "Ошибка при отправке "
+                "недельного дайджеста"
+            )
+
+    @weekly_digest_watcher.before_loop
+    async def before_weekly_digest_watcher(self):
 
         await self.wait_until_ready()
 
@@ -829,74 +877,71 @@ class CartelMarketBot(discord.Client):
     # НЕДЕЛЬНЫЙ ДАЙДЖЕСТ
     # =====================================================
 
-    async def check_weekly_digest(self):
+    async def send_weekly_digest(self):
 
         now = datetime.now(
             MOSCOW_TIMEZONE
         )
 
+        # ---------------------------------------------
+        # Определяем период отчёта
+        # ---------------------------------------------
 
-        # Пока не воскресенье —
-        # ничего делать не нужно
-        if (
-            now.weekday()
-            != WEEKLY_DIGEST_WEEKDAY
-        ):
-            return
-
-
-        # Ждём 21:00 МСК
-        if now.hour < WEEKLY_DIGEST_HOUR:
-            return
-
-
-        monday, sunday = get_week_bounds(
-            now.date()
+        period_start, period_end = (
+            get_digest_period(
+                now.date()
+            )
         )
 
-
-        # Идентификатор конкретной недели
-        digest_id = sunday.isoformat()
-
+        # Уникальный ID конкретного отчёта
+        digest_id = (
+            f"{period_start.isoformat()}_"
+            f"{period_end.isoformat()}"
+        )
 
         state = load_state()
 
+        # ---------------------------------------------
+        # Не отправляем один отчёт дважды
+        # ---------------------------------------------
 
-        # Этот дайджест уже отправляли
         if (
-            state.get(
-                "last_weekly_digest"
-            )
-            == digest_id
+                state.get(
+                    "last_weekly_digest"
+                )
+                == digest_id
         ):
+            logger.info(
+                "Недельный дайджест "
+                "уже был отправлен."
+            )
 
             return
 
+        # ---------------------------------------------
+        # Получаем скидки за 7 дней
+        # ---------------------------------------------
 
         weekly_sales = get_sales_for_week(
-            monday,
-            sunday
+            period_start,
+            period_end
         )
 
-
         if not weekly_sales:
-
             logger.info(
-                "За эту неделю Flash Sale "
-                "в истории нет."
+                "За выбранный период "
+                "Flash Sale не найдены."
             )
 
             return
-
 
         channel = await self.get_sales_channel()
 
         if channel is None:
             return
 
-
         # ---------------------------------------------
-        # WEEKLY EMBED
+        # Создаём один большой Embed
         # ---------------------------------------------
 
         embed = discord.Embed(
@@ -905,9 +950,11 @@ class CartelMarketBot(discord.Client):
                 "скидки за неделю"
             ),
             description=(
-                f"**{monday.strftime('%d.%m.%Y')} "
-                f"— "
-                f"{sunday.strftime('%d.%m.%Y')}**\n\n"
+                f"📅 **"
+                f"{period_start.strftime('%d.%m.%Y')}"
+                f" — "
+                f"{period_end.strftime('%d.%m.%Y')}"
+                f"**\n\n"
                 f"За неделю найдено "
                 f"**{len(weekly_sales)}** "
                 f"Flash Sale."
@@ -915,41 +962,34 @@ class CartelMarketBot(discord.Client):
             color=discord.Color.gold()
         )
 
-
         # ---------------------------------------------
-        # КАЖДАЯ СКИДКА — ОТДЕЛЬНЫЙ БЛОК
+        # Добавляем товары списком
         # ---------------------------------------------
 
         for index, sale in enumerate(
-            weekly_sales,
-            start=1
+                weekly_sales,
+                start=1
         ):
-
             sale_date = date.fromisoformat(
                 sale["sale_date"]
             )
 
-            field_name = (
-                f"{index}. {sale['item']}"
-            )
-
-            field_value = (
-                f"💰 **{sale['price']} "
-                f"Cartel Coins**\n"
-                f"📅 "
-                f"{sale_date.strftime('%d.%m.%Y')}\n"
-                f"🔗 "
-                f"[Открыть источник]"
-                f"({sale['link']})"
-            )
-
-
             embed.add_field(
-                name=field_name,
-                value=field_value,
+                name=(
+                    f"{index}. "
+                    f"{sale['item']}"
+                ),
+                value=(
+                    f"💰 **{sale['price']} "
+                    f"Cartel Coins**\n"
+                    f"📅 "
+                    f"{sale_date.strftime('%d.%m.%Y')}\n"
+                    f"🔗 "
+                    f"[Открыть источник]"
+                    f"({sale['link']})"
+                ),
                 inline=False
             )
-
 
         embed.set_footer(
             text=(
@@ -958,14 +998,16 @@ class CartelMarketBot(discord.Client):
             )
         )
 
+        # ---------------------------------------------
+        # Отправляем
+        # ---------------------------------------------
 
         await channel.send(
             embed=embed
         )
 
-
         # ---------------------------------------------
-        # ЗАПОМИНАЕМ ДАЙДЖЕСТ
+        # Запоминаем отправку
         # ---------------------------------------------
 
         state[
@@ -975,7 +1017,6 @@ class CartelMarketBot(discord.Client):
         save_state(
             state
         )
-
 
         logger.info(
             "Недельный дайджест "
