@@ -314,6 +314,7 @@ def add_sale_to_history(
             "price": parsed_sale["price"],
             "link": sale_link,
             "title": sale_title
+            "image_url": image_url
         }
     )
 
@@ -431,6 +432,126 @@ async def get_reddit_feed():
 # ПОИСК FLASH SALE
 # =========================================================
 
+async def get_reddit_post_image(post_url):
+    """
+    Получает изображение из Reddit-поста.
+
+    Сначала пытаемся взять оригинальную картинку.
+    Если её нет — используем preview.
+    Если изображения вообще нет — возвращаем None.
+    """
+
+    if not post_url:
+        return None
+
+    json_url = (
+        post_url.rstrip("/")
+        + ".json?raw_json=1"
+    )
+
+    headers = {
+        "User-Agent": (
+            "discord-cartel-market-bot/2.0"
+        )
+    }
+
+    timeout = aiohttp.ClientTimeout(
+        total=20
+    )
+
+    try:
+
+        async with aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout
+        ) as session:
+
+            async with session.get(
+                json_url
+            ) as response:
+
+                response.raise_for_status()
+
+                reddit_data = await response.json()
+
+    except (
+        aiohttp.ClientError,
+        ValueError,
+        KeyError,
+        IndexError
+    ) as error:
+
+        logger.warning(
+            "Не удалось получить изображение Reddit: %s",
+            error
+        )
+
+        return None
+
+
+    try:
+
+        post = (
+            reddit_data[0]
+            ["data"]
+            ["children"][0]
+            ["data"]
+        )
+
+    except (
+        KeyError,
+        IndexError,
+        TypeError
+    ):
+
+        return None
+
+
+    # -------------------------------------------------
+    # 1. Пытаемся получить оригинальное изображение
+    # -------------------------------------------------
+
+    image_url = post.get(
+        "url_overridden_by_dest"
+    )
+
+    if image_url:
+
+        if image_url.lower().endswith(
+            (
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp"
+            )
+        ):
+
+            return image_url
+
+
+    # -------------------------------------------------
+    # 2. Если оригинала нет — берём Reddit preview
+    # -------------------------------------------------
+
+    try:
+
+        image_url = (
+            post["preview"]
+            ["images"][0]
+            ["source"]
+            ["url"]
+        )
+
+        return image_url
+
+    except (
+        KeyError,
+        IndexError,
+        TypeError
+    ):
+
+        return None
+
 async def get_latest_flash_sale():
     """
     Ищет последнюю Flash Sale среди
@@ -449,16 +570,22 @@ async def get_latest_flash_sale():
         title_lower = title.lower()
 
         if (
-            title_lower.startswith("flash")
-            and "sale for" in title_lower
+                title_lower.startswith("flash")
+                and "sale for" in title_lower
         ):
+            post_link = entry.get(
+                "link",
+                ""
+            )
+
+            image_url = await get_reddit_post_image(
+                post_link
+            )
 
             return {
                 "title": title,
-                "link": entry.get(
-                    "link",
-                    ""
-                )
+                "link": post_link,
+                "image_url": image_url
             }
 
     return None
@@ -854,6 +981,15 @@ class CartelMarketBot(discord.Client):
                 "• Daily Flash Sale"
             )
         )
+
+        image_url = sale.get(
+            "image_url"
+        )
+
+        if image_url:
+            embed.set_image(
+                url=image_url
+            )
 
 
         await channel.send(
