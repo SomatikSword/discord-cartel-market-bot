@@ -5,6 +5,7 @@ import re
 from datetime import datetime, date, time, timedelta, timezone
 from pathlib import Path
 
+from io import BytesIO
 import aiohttp
 import discord
 import feedparser
@@ -108,6 +109,10 @@ REDDIT_RSS_URL = (
     "r/swtor/new.rss?limit=100"
 )
 
+REDDIT_JSON_URL = (
+    "https://www.reddit.com/"
+    "r/swtor/new.json?limit=100&raw_json=1"
+)
 
 # =========================================================
 # ЛОГИ
@@ -313,8 +318,7 @@ def add_sale_to_history(
             "item": parsed_sale["item"],
             "price": parsed_sale["price"],
             "link": sale_link,
-            "title": sale_title
-            "image_url": image_url
+            "title": sale_title,
         }
     )
 
@@ -554,41 +558,126 @@ async def get_reddit_post_image(post_url):
 
 async def get_latest_flash_sale():
     """
-    Ищет последнюю Flash Sale среди
-    новых постов r/swtor.
+    Получает последнюю Flash Sale через Reddit JSON.
+
+    Вместе с названием, ссылкой и ценой
+    получаем прямую ссылку на изображение поста.
     """
 
-    feed = await get_reddit_feed()
+    headers = {
+        "User-Agent": (
+            "discord-cartel-market-bot/3.0"
+        )
+    }
 
-    for entry in feed.entries:
+    timeout = aiohttp.ClientTimeout(
+        total=20
+    )
 
-        title = entry.get(
+    async with aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout
+    ) as session:
+
+        async with session.get(
+            REDDIT_JSON_URL
+        ) as response:
+
+            response.raise_for_status()
+
+            reddit_data = await response.json(
+                content_type=None
+            )
+
+
+    posts = (
+        reddit_data
+        .get("data", {})
+        .get("children", [])
+    )
+
+
+    for child in posts:
+
+        post = child.get(
+            "data",
+            {}
+        )
+
+        title = post.get(
             "title",
             ""
         ).strip()
 
         title_lower = title.lower()
 
+
         if (
-                title_lower.startswith("flash")
-                and "sale for" in title_lower
+            title_lower.startswith("flash")
+            and "sale for" in title_lower
         ):
-            post_link = entry.get(
-                "link",
+
+            # -----------------------------------------
+            # ССЫЛКА НА REDDIT-ПОСТ
+            # -----------------------------------------
+
+            permalink = post.get(
+                "permalink",
                 ""
             )
 
-            image_url = await get_reddit_post_image(
-                post_link
+            post_link = (
+                "https://www.reddit.com"
+                + permalink
             )
+
+
+            # -----------------------------------------
+            # ОРИГИНАЛЬНАЯ КАРТИНКА
+            # -----------------------------------------
+
+            image_url = post.get(
+                "url_overridden_by_dest"
+            )
+
+
+            # -----------------------------------------
+            # FALLBACK:
+            # если прямой картинки нет,
+            # пробуем взять Reddit Preview
+            # -----------------------------------------
+
+            if not image_url:
+
+                try:
+
+                    image_url = (
+                        post["preview"]
+                        ["images"][0]
+                        ["source"]
+                        ["url"]
+                    )
+
+                except (
+                    KeyError,
+                    IndexError,
+                    TypeError
+                ):
+
+                    image_url = None
+
+
+            logger.info(
+                "Изображение Flash Sale: %s",
+                image_url
+            )
+
 
             return {
                 "title": title,
                 "link": post_link,
                 "image_url": image_url
             }
-
-    return None
 
 
 # =========================================================
@@ -713,6 +802,96 @@ def get_sales_for_week(
 
     return result
 
+# =========================================================
+# Добавляем скачивание картинки
+# =========================================================
+
+async def download_sale_image(
+    image_url
+):
+    """
+    Скачивает картинку лота с Reddit.
+
+    Возвращает discord.File,
+    который можно прикрепить к Embed.
+    """
+
+    if not image_url:
+        return None
+
+
+    headers = {
+        "User-Agent": (
+            "discord-cartel-market-bot/3.0"
+        )
+    }
+
+    timeout = aiohttp.ClientTimeout(
+        total=20
+    )
+
+
+    try:
+
+        async with aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout
+        ) as session:
+
+            async with session.get(
+                image_url
+            ) as response:
+
+                response.raise_for_status()
+
+                image_bytes = (
+                    await response.read()
+                )
+
+                content_type = (
+                    response.headers.get(
+                        "Content-Type",
+                        ""
+                    )
+                )
+
+
+    except aiohttp.ClientError as error:
+
+        logger.warning(
+            "Не удалось скачать изображение: %s",
+            error
+        )
+
+        return None
+
+
+    # ---------------------------------------------
+    # Определяем расширение
+    # ---------------------------------------------
+
+    if "png" in content_type:
+
+        filename = "cartel-sale.png"
+
+    elif "webp" in content_type:
+
+        filename = "cartel-sale.webp"
+
+    else:
+
+        filename = "cartel-sale.jpg"
+
+
+    image_buffer = BytesIO(
+        image_bytes
+    )
+
+
+    return discord.File(
+        image_buffer,
+        filename=filename
+    )
 
 # =========================================================
 # DISCORD BOT
@@ -991,10 +1170,47 @@ class CartelMarketBot(discord.Client):
                 url=image_url
             )
 
+        # ---------------------------------------------
+        # СКАЧИВАЕМ ИЗОБРАЖЕНИЕ ЛОТА
+        # ---------------------------------------------
 
-        await channel.send(
-            embed=embed
+        image_file = await download_sale_image(
+            sale.get("image_url")
         )
+
+        # ---------------------------------------------
+        # ЕСЛИ КАРТИНКА ЕСТЬ
+        # ---------------------------------------------
+
+        if image_file is not None:
+
+            embed.set_image(
+                url=(
+                    f"attachment://"
+                    f"{image_file.filename}"
+                )
+            )
+
+            await channel.send(
+                embed=embed,
+                file=image_file
+            )
+
+
+        # ---------------------------------------------
+        # ЕСЛИ КАРТИНКУ ПОЛУЧИТЬ НЕ УДАЛОСЬ
+        # ---------------------------------------------
+
+        else:
+
+            logger.warning(
+                "Flash Sale отправляется "
+                "без изображения."
+            )
+
+            await channel.send(
+                embed=embed
+            )
 
 
         state["last_sale"] = sale_link
